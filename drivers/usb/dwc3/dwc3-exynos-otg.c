@@ -33,6 +33,8 @@
 #define BUS_ACTIVITY_CHECK	(0x3F << 16)
 #define READ_TRANS_OFFSET	10
 
+#define SSPHY_RESTART_EL	"SSPHY_RESTART"
+
 /* -------------------------------------------------------------------------- */
 static int dwc3_otg_reboot_notify(struct notifier_block *nb, unsigned long event, void *buf);
 static struct notifier_block dwc3_otg_reboot_notifier = {
@@ -71,7 +73,9 @@ static int dwc3_otg_statemachine(struct otg_fsm *fsm)
 		if (!fsm->id) {
 			otg->state = OTG_STATE_A_IDLE;
 		} else if (fsm->b_sess_vld) {
-			exynos->retry_cnt = 0;
+			/* TODO: change back to 0 if the issue is fixed*/
+			exynos->retry_cnt = REMOVED_RETRY_CNT;
+			dev_info(dev, "retry mechanism is bypass by overriding retry_cnt to REMOVED_RETRY_CNT\n");
 			ret = otg_start_gadget(fsm, 1);
 			if (!ret)
 				otg->state = OTG_STATE_B_PERIPHERAL;
@@ -258,6 +262,19 @@ static void usb3_phy_control(struct dwc3_otg	*dotg,
 		exynos_usbdrd_pipe3_disable(dwc->usb3_generic_phy);
 		dwc3_core_susphy_set(dwc, 1);
 	}
+}
+
+static void dwc3_usb3_phy_restart(struct dwc3_otg *dotg)
+{
+	struct dwc3 *dwc = dotg->dwc;
+
+	mutex_lock(&dotg->lock);
+
+	usb3_phy_control(dotg, 0, 0);
+	exynos_usbdrd_phy_tune(dwc->usb3_generic_phy, dotg->otg.state);
+	usb3_phy_control(dotg, 0, 1);
+
+	mutex_unlock(&dotg->lock);
 }
 
 int dwc3_otg_phy_enable(struct otg_fsm *fsm, int owner, bool on)
@@ -543,10 +560,10 @@ static int dwc3_otg_start_gadget(struct otg_fsm *fsm, int on)
 			goto err1;
 		}
 
-		ret = usb_gadget_activate(dwc->gadget);
-		if (ret < 0)
-			dev_err(dev, "USB gadget activate failed with %d\n", ret);
+		/* connect gadget */
+		usb_udc_vbus_handler(dwc->gadget, true);
 
+		exynos->gadget_state = true;
 		dwc3_otg_set_peripheral_mode(dotg);
 
 		dev_dbg(dev, "%s: start check usb configuration timer\n", __func__);
@@ -558,9 +575,8 @@ static int dwc3_otg_start_gadget(struct otg_fsm *fsm, int on)
 		exynos->vbus_state = false;
 		del_timer_sync(&exynos->usb_connect_timer);
 
-		ret = usb_gadget_deactivate(dwc->gadget);
-		if (ret < 0)
-			dev_err(dev, "USB gadget deactivate failed with %d\n", ret);
+		/* disconnect gadget */
+		usb_udc_vbus_handler(dwc->gadget, false);
 
 		if (exynos->config.is_not_vbus_pad && exynos_usbdrd_get_ldo_status() &&
 				!dotg->in_shutdown)
@@ -569,6 +585,7 @@ static int dwc3_otg_start_gadget(struct otg_fsm *fsm, int on)
 		if (exynos->extra_delay)
 			msleep(100);
 
+		exynos->gadget_state = false;
 		ret = dwc3_otg_phy_enable(fsm, 0, on);
 err1:
 		__pm_relax(dotg->wakelock);
@@ -990,6 +1007,17 @@ int dwc3_otg_usb_recovery_reconn(struct dwc3_exynos *exynos)
 	return 0;
 }
 
+static int dwc3_otg_ssphy_restart_cb(struct gvotable_election *el, const char *reason, void *value)
+{
+	struct dwc3_otg *dotg = gvotable_get_data(el);
+	bool restart_phy = !!(long)value;
+
+	if (restart_phy)
+		dwc3_usb3_phy_restart(dotg);
+
+	return 0;
+}
+
 static int dwc3_otg_pm_notifier(struct notifier_block *nb,
 		unsigned long action, void *nb_data)
 {
@@ -1083,6 +1111,16 @@ int dwc3_exynos_otg_init(struct dwc3 *dwc, struct dwc3_exynos *exynos)
 	if (ret)
 		dev_err(dwc->dev, "failed register reboot notifier\n");
 
+	dotg->ssphy_restart_votable = gvotable_create_bool_election(SSPHY_RESTART_EL,
+								    dwc3_otg_ssphy_restart_cb,
+								    dotg);
+	if (IS_ERR_OR_NULL(dotg->ssphy_restart_votable)) {
+		ret = PTR_ERR(dotg->ssphy_restart_votable);
+		dev_err(dwc->dev, "failed to create ssphy_restart votable (%d)\n", ret);
+		return ret;
+	}
+	gvotable_set_vote2str(dotg->ssphy_restart_votable, gvotable_v2s_int);
+
 	dev_dbg(dwc->dev, "otg_init done\n");
 
 	return 0;
@@ -1095,6 +1133,7 @@ void dwc3_exynos_otg_exit(struct dwc3 *dwc, struct dwc3_exynos *exynos)
 	if (!dotg->ext_otg_ops)
 		return;
 
+	gvotable_destroy_election(dotg->ssphy_restart_votable);
 	unregister_pm_notifier(&dotg->pm_nb);
 
 	dwc3_ext_otg_exit(dotg);
